@@ -1,36 +1,56 @@
 # Self-Stream Transcoding Engine
 
-**Self-hosted video streaming infrastructure. Upload, transcode to HLS, and stream, All you pay is the cost of an EC2 instance(Or whichever hosting platform you use).**
+> **Stop paying per minute. Own your video pipeline.**
 
-We replaced Cloudflare Stream (billed per minute of video stored + delivered) with a custom pipeline that runs entirely on our own infrastructure. The result: the same upload-to-playback experience at a fraction of the cost, especially at bulk scale.
-
-This repo contains the **transcoding engine** the core worker that powers the pipeline. It downloads uploaded videos from S3-compatible object storage, transcodes them into multi-variant HLS using FFmpeg, uploads the HLS segments back, and updates your database with the stream URL.
+A production-ready, self-hosted video transcoding engine built on NestJS. Upload videos directly to Cloudflare R2, transcode to adaptive bitrate HLS with FFmpeg, and stream to any device — all for the flat cost of a single server.
 
 ---
 
-## What it solves
+## The Cost Problem With Managed Video Platforms
 
-Managed video platforms (Cloudflare Stream, Mux, AWS MediaConvert) charge **per minute of video stored and delivered**. When you're uploading hundreds of videos per month, costs add up fast.
+Platforms like Cloudflare Stream and Mux charge **per minute of video stored** and **per minute of video delivered**. That sounds cheap until your library grows.
 
-We needed:
-- Direct upload to cheap object storage (Cloudflare R2)
-- Background transcoding that doesn't block the user
-- Adaptive bitrate streaming (HLS) for any device
-- Real-time status tracking (uploading → processing → ready)
-- All of this for **just the cost of running an EC2/VPS instance**
+| Scenario | Cloudflare Stream | This Engine |
+|---|---|---|
+| 100 videos × 10 min avg, 50 views/video/mo | ~$55/mo | ~$21/mo |
+| 500 videos × 10 min avg, 50 views/video/mo | ~$275/mo | ~$21/mo |
+| 1,000 videos × 10 min avg, 50 views/video/mo | ~$550/mo | ~$23/mo |
+| 5,000 videos × 10 min avg, 50 views/video/mo | ~$2,750/mo | ~$28/mo |
+
+**Managed platforms scale linearly with your library. This engine doesn't.**
+
+Your costs with this engine:
+- **Server**: ~$10–40/mo (EC2 t3.small or equivalent VPS) — flat, regardless of video count
+- **Storage**: ~$0.015/GB/mo on Cloudflare R2 — 1,000 videos ≈ $3/mo
+- **Bandwidth**: **$0** — Cloudflare R2 has zero egress fees
+
+Beyond ~50 videos, self-hosting wins. At 1,000+ videos, you're saving hundreds of dollars every month.
+
+---
+
+## What it Does
+
+- **Direct browser upload** to Cloudflare R2 via presigned URLs — no proxying through your backend
+- **Background transcoding** via BullMQ so uploads never block the user
+- **Multi-variant HLS** (480p + 720p) for adaptive bitrate streaming on any device
+- **Real-time status tracking**: `PENDING → PROCESSING → READY | FAILED`
+- **Auto-retry** on failure with exponential backoff via BullMQ
+- **Multi-tenant** — video paths are scoped by `tenantId`
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology | Role |
+Every component was chosen to keep costs low and reliability high:
+
+| Layer | Technology | Why |
 |---|---|---|
-| **Queue** | BullMQ + Redis | Reliable job queue with retries & backoff |
-| **Transcoding** | FFmpeg (libx264 + AAC) | Video encoding to multi-variant HLS |
-| **Storage** | Cloudflare R2 (S3-compatible) | Object storage with zero egress fees |
-| **Upload** | AWS SDK v3 (S3Client) | Presigned URLs for direct browser-to-R2 upload |
-| **Database** | PostgreSQL + TypeORM | Video record + status tracking |
-| **Framework** | NestJS | Backend API + worker host |
+| **Queue** | BullMQ + Redis | Reliable job processing with retries & backoff — no dropped jobs |
+| **Transcoding** | FFmpeg (libx264 + AAC) | Industry-standard, free, runs on any Linux server |
+| **Storage** | Cloudflare R2 (S3-compatible) | $0.015/GB/mo storage, **zero egress fees** — no bandwidth bill |
+| **Upload** | AWS SDK v3 (S3Client) | Presigned URLs let the browser upload directly — no backend bandwidth cost |
+| **Database** | PostgreSQL + TypeORM | Video metadata and status tracking |
+| **Framework** | NestJS | Backend API + BullMQ worker host |
 
 ---
 
@@ -117,12 +137,6 @@ We needed:
    Upload MP4 to R2
          │
          ▼
-  ┌──────────────┐
-  │ POST /queue- │
-  │ transcoding  │
-  └──────┬───────┘
-         │
-         ▼
   ┌──────────────┐     ┌─────────┐
   │ Videos       │────►│ BullMQ  │
   │ Service      │     │ Redis   │
@@ -143,16 +157,19 @@ We needed:
                  │  Extract duration    │
                  └──────────┬───────────┘
                             │
-                   ┌────────┴────────┐
-                   ▼                 ▼
-          ┌───────────────┐  ┌───────────────┐
-          │ FFmpeg        │  │ FFmpeg        │
-          │ Encode 480p   │  │ Encode 720p   │
-          │ HLS variant   │  │ HLS variant   │
-          │ (sequential)  │  │ (sequential)  │
-          └───────┬───────┘  └──────┬────────┘
-                  │                 │
-                  └────────┬────────┘
+                            ▼
+                 ┌──────────────────────┐
+                 │  FFmpeg              │
+                 │  Encode 480p         │
+                 │  HLS variant         │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                 ┌──────────────────────┐
+                 │  FFmpeg              │
+                 │  Encode 720p         │
+                 │  HLS variant         │
+                 └──────────┬───────────┘
                            ▼
                 ┌──────────────────────┐
                 │ Generate master      │
@@ -290,49 +307,149 @@ Node.js >= 18, FFmpeg (`sudo apt install ffmpeg`), Redis, PostgreSQL, and an S3-
 
 ### Getting Started
 
-1. Copy the `src/` folder into your NestJS project and adjust import paths
-2. Install the required packages: `@nestjs/bullmq`, `bullmq`, `ioredis`, `@aws-sdk/client-s3`, `@aws-sdk/lib-storage`, `@aws-sdk/s3-request-presigner`, `fluent-ffmpeg`, `fs-extra`, `class-validator`, `class-transformer`, `typeorm`, `@nestjs/typeorm`
-3. Register `TranscodingProcessor` and `R2UploadService` as providers in your NestJS module, and register the `video-transcoding` BullMQ queue
-4. Configure BullMQ with your Redis connection in your root `AppModule`
-5. Copy `.env.example` to `.env` and fill in your R2/Redis/DB credentials
-6. When a video upload completes, update its status to `PROCESSING` and add a job to the `video-transcoding` queue with `{ videoId, key, tenantId }`
-7. Once the job finishes and status becomes `READY`, use the `hlsUrl` from the database with **hls.js** on the frontend to play the video
+**1. Copy the `src/` folder into your NestJS project and adjust import paths**
+
+**2. Install the required packages:**
+
+```bash
+npm install @nestjs/bullmq bullmq ioredis \
+  @aws-sdk/client-s3 @aws-sdk/lib-storage @aws-sdk/s3-request-presigner \
+  fluent-ffmpeg fs-extra \
+  class-validator class-transformer \
+  typeorm @nestjs/typeorm pg
+```
+
+**3. Register the queue, processor, and services in your NestJS module:**
+
+```typescript
+// app.module.ts
+import { BullModule } from '@nestjs/bullmq';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { TranscodingProcessor } from './processor/transcoding.processor';
+import { R2UploadService } from './services/r2-upload.service';
+import { Video } from './entities/video.entity';
+
+@Module({
+  imports: [
+    BullModule.forRoot({
+      connection: {
+        host: process.env.REDIS_HOST,
+        port: Number(process.env.REDIS_PORT),
+      },
+    }),
+    BullModule.registerQueue({ name: 'video-transcoding' }),
+    TypeOrmModule.forFeature([Video]),
+  ],
+  providers: [TranscodingProcessor, R2UploadService],
+})
+export class AppModule {}
+```
+
+> For TypeORM entity sync: set `synchronize: true` in your TypeORM config during development, or generate and run a migration in production to create the `videos` table.
+
+**4. Copy `.env.example` to `.env` and fill in your R2/Redis/DB credentials**
+
+**5. Configure your Cloudflare R2 bucket:**
+
+- **Public access**: The transcoding worker downloads the original uploaded video via a plain HTTP GET. Your R2 bucket (or at minimum the `videos/` path) must have public read access enabled, otherwise the download will fail.
+- **CORS**: For presigned URL browser uploads to work, configure CORS on your R2 bucket:
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://your-frontend-domain.com"],
+    "AllowedMethods": ["PUT", "POST"],
+    "AllowedHeaders": ["*"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+**6. Implement the `POST /queue-transcoding` endpoint in your own API**
+
+This endpoint is **not included in this repo** — you need to implement it. It should:
+1. Create or update the video record in your database with `hlsStatus = PROCESSING`
+2. Enqueue a job on the `video-transcoding` BullMQ queue
+
+```typescript
+// Example using BullMQ's Queue directly
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+
+constructor(@InjectQueue('video-transcoding') private transcodingQueue: Queue) {}
+
+async queueTranscoding(videoId: string, key: string, tenantId: string) {
+  await this.videoRepository.update({ id: videoId }, { hlsStatus: VideoHlsStatus.PROCESSING });
+  await this.transcodingQueue.add('transcode', { videoId, key, tenantId });
+}
+```
+
+**7. Play the video on the frontend**
+
+Once `hlsStatus` becomes `READY`, use the `hlsUrl` from the database with **hls.js**:
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<video id="video" controls></video>
+<script>
+  const video = document.getElementById('video');
+  const hlsUrl = 'YOUR_HLS_URL_FROM_DB'; // e.g. https://pub-xxx.r2.dev/.../playlist.m3u8
+
+  if (Hls.isSupported()) {
+    const hls = new Hls();
+    hls.loadSource(hlsUrl);
+    hls.attachMedia(video);
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Native HLS support (Safari)
+    video.src = hlsUrl;
+  }
+</script>
+```
 
 ---
 
 ## FFmpeg Encoding Profiles
 
-The engine encodes two variants sequentially (to keep memory low on small instances):
+The engine encodes two variants sequentially to keep peak memory low — safe to run on small, cheap instances:
 
 | Variant | Resolution | Video Bitrate | Max Rate | Buffer | Audio |
 |---|---|---|---|---|---|
 | **v480** | 854 x 480 | 1250 kbps | 1500 kbps | 3000 kb | AAC 128k |
 | **v720** | 1280 x 720 | 3000 kbps | 3500 kbps | 7000 kb | AAC 128k |
 
-Common FFmpeg flags used:
-- `-preset veryfast` — fast encoding, slightly larger files (good trade-off for server cost)
-- `-profile:v high -level 4.0` — broad device compatibility
-- `-hls_time 6` — 6-second segments (standard for adaptive streaming)
-- `-threads 2` — limits CPU usage per job (safe for shared instances)
+Key FFmpeg flags and why they matter for cost:
+
+| Flag | Value | Why |
+|---|---|---|
+| `-preset` | `veryfast` | Encodes fast, keeping server time per job low |
+| `-threads` | `2` | Limits CPU per job — lets one server handle multiple concurrent jobs safely |
+| `-profile:v high -level 4.0` | — | Broad device compatibility — no re-encoding needed client-side |
+| `-hls_time` | `6` | 6-second segments — standard for smooth adaptive streaming |
 
 Want to add 1080p? Just add another `encodeVariant()` call with `1920x1080` resolution.
 
 ---
 
-## Cost Comparison
+## Why Cloudflare R2 for Storage
 
-Managed platforms like Cloudflare Stream charge per minute stored and per minute delivered. At scale, this grows linearly with your library size.
+R2 was chosen specifically because it eliminates the bandwidth bill — the hidden cost that makes other cloud storage expensive at scale:
 
-With this engine, your only recurring costs are **object storage** (R2 is $0.015/GB/mo with zero egress fees) and **your server** (~$10-40/mo for an EC2/VPS). The storage cost is negligible and the server cost stays flat no matter how many videos you add. Beyond ~50 videos, self-hosting wins — and the gap only widens from there.
+| Provider | Storage | Egress (bandwidth) |
+|---|---|---|
+| **Cloudflare R2** | $0.015/GB/mo | **$0.00** |
+| AWS S3 | $0.023/GB/mo | $0.09/GB |
+| Backblaze B2 | $0.006/GB/mo | $0.01/GB |
+| Google Cloud Storage | $0.020/GB/mo | $0.08/GB |
+
+With R2, you pay only for storage. Every video view is free bandwidth — no matter how many times it's watched.
 
 ---
 
 ## Author
 
-**Faheem Malik - Senior Full Stack Engineer and solution architect**
+**Faheem Malik - Senior Full Stack Engineer and Solution Architect**
 
 I specialize in building cost-efficient, production-grade software systems: scalable backends, distributed job processing, cloud infrastructure, and clean, maintainable product engineering from MVP to scale.
-
 
 [![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/faheemmalik11)
 [![Upwork](https://img.shields.io/badge/Upwork-14A800?style=for-the-badge&logo=upwork&logoColor=white)](https://www.upwork.com/freelancers/faheemmalik)
